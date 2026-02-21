@@ -15,6 +15,61 @@ This is a complete rewrite of the Node.js/TypeScript implementation in Rust, pro
 
 ## Architecture
 
+### Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph Client["Client"]
+        User[User / API Client]
+    end
+
+    subgraph API["Blockchain Document Storage (Actix-web)"]
+        direction TB
+        MW[Middleware: CORS, Logger, JWT Auth]
+        subgraph Routes["HTTP Routes"]
+            Auth["/api/auth"]
+            Docs["/api/documents"]
+            BC["/api/blockchain"]
+            Health["/health"]
+        end
+        subgraph Handlers["Handlers"]
+            AuthH[auth: register, login, me, logout]
+            DocsH[documents: upload, list, get, verify, transfer]
+            HealthH[health check]
+        end
+        subgraph Services["Services"]
+            AuthS[AuthService]
+            StorageS[StorageService]
+            BCS[BlockchainService]
+        end
+        subgraph Utils["Utils"]
+            Hash[hash: SHA-256]
+        end
+    end
+
+    subgraph External["External Systems"]
+        MySQL[(MySQL / TiDB)]
+        S3[(AWS S3)]
+        ETH[Ethereum Network]
+    end
+
+    User -->|HTTP| MW
+    MW --> Routes
+    Auth --> AuthH
+    Docs --> DocsH
+    Health --> HealthH
+    BC --> DocsH
+    AuthH --> AuthS
+    DocsH --> StorageS
+    DocsH --> BCS
+    DocsH --> Hash
+    AuthH --> Hash
+    StorageS --> S3
+    AuthS --> MySQL
+    BCS --> ETH
+    DocsH --> MySQL
+```
+
 ### Technology Stack
 
 **Web Framework:**
