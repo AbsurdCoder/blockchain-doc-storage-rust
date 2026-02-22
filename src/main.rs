@@ -10,8 +10,10 @@ mod models;
 mod services;
 mod utils;
 
-use handlers::{auth, documents, health};
+use handlers::{auth, documents, health, metrics};
 use services::{blockchain::BlockchainService, storage::StorageService};
+use std::sync::Arc;
+use utils::Metrics;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +21,7 @@ pub struct AppState {
     pub blockchain: BlockchainService,
     pub storage: StorageService,
     pub jwt_secret: String,
+    pub metrics: Arc<Metrics>,
 }
 
 #[actix_web::main]
@@ -55,6 +58,7 @@ async fn main() -> std::io::Result<()> {
         blockchain: blockchain_service,
         storage: storage_service,
         jwt_secret,
+        metrics: Arc::new(Metrics::default()),
     };
 
     let server_address = format!("{}:{}", server_host, server_port);
@@ -70,6 +74,8 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             // Health check
             .route("/health", web::get().to(health::health_check))
+            // Metrics
+            .route("/api/metrics", web::get().to(metrics::get_metrics))
             // Auth routes
             .service(
                 web::scope("/api/auth")

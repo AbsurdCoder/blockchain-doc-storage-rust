@@ -314,6 +314,27 @@ Content-Type: application/json
 GET /api/blockchain/status
 ```
 
+### Metrics
+
+**Get Processing Metrics:**
+```bash
+GET /api/metrics
+```
+
+Returns JSON with processing statistics:
+```json
+{
+  "documents_uploaded": 42,
+  "documents_upload_errors": 2,
+  "documents_listed": 156,
+  "documents_fetched": 89,
+  "documents_verified": 23,
+  "transfers_initiated": 5,
+  "auth_logins": 34,
+  "auth_registrations": 12
+}
+```
+
 ### Health Check
 
 ```bash

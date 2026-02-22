@@ -41,21 +41,28 @@ fn build_upload_response(
 
 pub async fn upload_document(
     user: AuthenticatedUser,
-    _state: web::Data<AppState>,
+    state: web::Data<AppState>,
     payload: web::Json<UploadDocumentRequest>,
 ) -> impl Responder {
     match build_upload_response(&user, &payload.into_inner()) {
-        Ok(response) => HttpResponse::Ok().json(response),
-        Err(msg) => HttpResponse::BadRequest().body(msg),
+        Ok(response) => {
+            state.metrics.record_document_uploaded();
+            HttpResponse::Ok().json(response)
+        }
+        Err(msg) => {
+            state.metrics.record_document_upload_error();
+            HttpResponse::BadRequest().body(msg)
+        }
     }
 }
 
 pub async fn list_documents(
     user: AuthenticatedUser,
-    _state: web::Data<AppState>,
+    state: web::Data<AppState>,
     _query: web::Query<serde_json::Value>,
 ) -> impl Responder {
     let _user_id = user.user_id();
+    state.metrics.record_documents_listed();
 
     let empty: Vec<DocumentResponse> = Vec::new();
     HttpResponse::Ok().json(empty)
@@ -63,10 +70,11 @@ pub async fn list_documents(
 
 pub async fn get_document(
     user: AuthenticatedUser,
-    _state: web::Data<AppState>,
+    state: web::Data<AppState>,
     path: web::Path<i32>,
 ) -> impl Responder {
     let _user_id = user.user_id();
+    state.metrics.record_document_fetched();
     let id = path.into_inner();
 
     let doc = Document {
@@ -97,10 +105,11 @@ pub async fn get_document(
 }
 
 pub async fn verify_document(
-    _state: web::Data<AppState>,
+    state: web::Data<AppState>,
     payload: web::Json<VerifyDocumentRequest>,
 ) -> impl Responder {
     let request = payload.into_inner();
+    state.metrics.record_document_verified();
 
     let response = VerificationResponse {
         exists: request.document_hash.is_some() || request.file_content.is_some(),
@@ -118,13 +127,14 @@ pub async fn verify_document(
 
 pub async fn transfer_ownership(
     user: AuthenticatedUser,
-    _state: web::Data<AppState>,
+    state: web::Data<AppState>,
     path: web::Path<i32>,
     payload: web::Json<TransferOwnershipRequest>,
 ) -> impl Responder {
     let _user_id = user.user_id();
     let _document_id = path.into_inner();
     let _request = payload.into_inner();
+    state.metrics.record_transfer_initiated();
 
     HttpResponse::NotImplemented().body("transfer_ownership not yet implemented")
 }
