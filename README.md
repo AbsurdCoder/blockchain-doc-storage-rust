@@ -116,6 +116,7 @@ blockchain-doc-storage-rust/
 ├── .env.example               # Environment variables template
 ├── README.md                  # This file
 ├── RUST_GUIDE.md             # Detailed Rust implementation guide
+├── FRONTEND_DESIGN.md        # Frontend architecture & API integration
 ├── src/
 │   ├── main.rs               # Application entry point
 │   ├── models/               # Data models
@@ -574,7 +575,7 @@ MIT License - see LICENSE file for details
 For issues and questions:
 - GitHub Issues: [Create an issue]
 - Documentation: See RUST_GUIDE.md
-- Examples: See `examples/` directory
+- Frontend: See FRONTEND_DESIGN.md for web UI architecture and API integration
 
 ---
 
