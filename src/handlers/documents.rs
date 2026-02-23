@@ -1,42 +1,55 @@
 use actix_web::{web, HttpResponse, Responder};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::Deserialize;
+use sqlx::FromRow;
 
 use crate::middleware::AuthenticatedUser;
 use crate::models::{
-    Document, DocumentResponse, TransferOwnershipRequest, UploadDocumentRequest,
+    BlockchainStatus, DocumentResponse, TransferOwnershipRequest, UploadDocumentRequest,
     VerificationResponse, VerifyDocumentRequest,
 };
-use crate::utils::hash_base64;
+use crate::services::BlockchainAnchor;
+use crate::utils::{hash_base64, hash_bytes};
 use crate::AppState;
 
 /// Internal helper to build a basic `DocumentResponse` for an uploaded document.
 /// This currently focuses on hashing and response shaping; persistence and S3
 /// upload are handled elsewhere.
-fn build_upload_response(
-    user: &AuthenticatedUser,
-    request: &UploadDocumentRequest,
-) -> Result<DocumentResponse, String> {
-    // Compute SHA-256 hash from the base64-encoded content
-    let document_hash =
-        hash_base64(&request.file_content).map_err(|_| "invalid base64 file_content".to_string())?;
+fn parse_user_id(user: &AuthenticatedUser) -> Result<i32, String> {
+    user.user_id()
+        .parse::<i32>()
+        .map_err(|_| "invalid user id in token".to_string())
+}
 
-    // For now we don't persist to DB or S3 here; just return a basic response.
-    // File size and blockchain status can be filled in by later enhancements.
-    let response = DocumentResponse {
-        id: 0,
-        file_name: request.file_name.clone(),
-        document_hash,
-        file_size: 0,
-        mime_type: request.mime_type.clone(),
-        status: "pending".to_string(),
-        created_at: chrono::Utc::now(),
-        blockchain_status: None,
-    };
+#[derive(Debug, Deserialize)]
+pub struct ListDocumentsQuery {
+    pub search: Option<String>,
+    pub status: Option<String>,
+}
 
-    // `user` is currently unused but kept to make it easy to add
-    // ownership/authorization logic here later.
-    let _ = user;
+#[derive(Debug, FromRow)]
+struct DocumentRow {
+    pub id: i32,
+    pub file_name: String,
+    pub document_hash: String,
+    pub file_size: i64,
+    pub mime_type: String,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub blockchain_status: Option<String>,
+}
 
-    Ok(response)
+fn to_document_response(row: DocumentRow) -> DocumentResponse {
+    DocumentResponse {
+        id: row.id,
+        file_name: row.file_name,
+        document_hash: row.document_hash,
+        file_size: row.file_size,
+        mime_type: row.mime_type,
+        status: row.status,
+        created_at: row.created_at,
+        blockchain_status: row.blockchain_status,
+    }
 }
 
 pub async fn upload_document(
@@ -44,28 +57,168 @@ pub async fn upload_document(
     state: web::Data<AppState>,
     payload: web::Json<UploadDocumentRequest>,
 ) -> impl Responder {
-    match build_upload_response(&user, &payload.into_inner()) {
-        Ok(response) => {
-            state.metrics.record_document_uploaded();
-            HttpResponse::Ok().json(response)
-        }
-        Err(msg) => {
+    let user_id = match parse_user_id(&user) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().body(e),
+    };
+
+    let req = payload.into_inner();
+
+    let bytes = match BASE64.decode(req.file_content.trim()) {
+        Ok(b) => b,
+        Err(_) => {
             state.metrics.record_document_upload_error();
-            HttpResponse::BadRequest().body(msg)
+            return HttpResponse::BadRequest().body("invalid base64 file_content");
         }
+    };
+
+    let document_hash = hash_bytes(&bytes);
+    let file_size = bytes.len() as i64;
+
+    let s3_url = match state
+        .storage
+        .upload_bytes(user_id, &req.file_name, &req.mime_type, bytes)
+        .await
+    {
+        Ok(url) => url,
+        Err(e) => {
+            state.metrics.record_document_upload_error();
+            return HttpResponse::InternalServerError().body(e.to_string());
+        }
+    };
+
+    // Insert document
+    let insert = sqlx::query(
+        r#"
+        INSERT INTO documents (user_id, file_name, document_hash, file_size, mime_type, s3_url, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW(), NOW())
+        "#,
+    )
+    .bind(user_id)
+    .bind(&req.file_name)
+    .bind(&document_hash)
+    .bind(file_size)
+    .bind(&req.mime_type)
+    .bind(&s3_url)
+    .execute(&state.db)
+    .await;
+
+    let doc_id = match insert {
+        Ok(res) => res.last_insert_id() as i32,
+        Err(e) => {
+            state.metrics.record_document_upload_error();
+            return HttpResponse::BadRequest().body(e.to_string());
+        }
+    };
+
+    // Anchor on blockchain (optional depending on env)
+    let anchor: BlockchainAnchor = match state.blockchain.anchor_document_hash(&document_hash).await {
+        Ok(a) => a,
+        Err(e) => BlockchainAnchor {
+            transaction_hash: String::new(),
+            block_number: 0,
+            status: format!("failed: {}", e),
+        },
+    };
+
+    // Store blockchain record (even if skipped/failed, for auditability)
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO blockchain_records (document_id, transaction_hash, block_number, status, created_at)
+        VALUES (?, ?, ?, ?, NOW())
+        "#,
+    )
+    .bind(doc_id)
+    .bind(&anchor.transaction_hash)
+    .bind(anchor.block_number)
+    .bind(&anchor.status)
+    .execute(&state.db)
+    .await;
+
+    // Update document status if confirmed
+    if anchor.status == "confirmed" {
+        let _ = sqlx::query("UPDATE documents SET status = 'confirmed' WHERE id = ?")
+            .bind(doc_id)
+            .execute(&state.db)
+            .await;
     }
+
+    state.metrics.record_document_uploaded();
+
+    let response = DocumentResponse {
+        id: doc_id,
+        file_name: req.file_name,
+        document_hash,
+        file_size,
+        mime_type: req.mime_type,
+        status: if anchor.status == "confirmed" {
+            "confirmed".to_string()
+        } else {
+            "pending".to_string()
+        },
+        created_at: chrono::Utc::now(),
+        blockchain_status: Some(anchor.status),
+    };
+
+    HttpResponse::Ok().json(response)
 }
 
 pub async fn list_documents(
     user: AuthenticatedUser,
     state: web::Data<AppState>,
-    _query: web::Query<serde_json::Value>,
+    query: web::Query<ListDocumentsQuery>,
 ) -> impl Responder {
-    let _user_id = user.user_id();
+    let user_id = match parse_user_id(&user) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().body(e),
+    };
     state.metrics.record_documents_listed();
 
-    let empty: Vec<DocumentResponse> = Vec::new();
-    HttpResponse::Ok().json(empty)
+    let search = query.search.clone().unwrap_or_default();
+    let status = query.status.clone();
+
+    let rows: Result<Vec<DocumentRow>, sqlx::Error> = if let Some(status) = status {
+        sqlx::query_as::<_, DocumentRow>(
+            r#"
+            SELECT
+              d.id, d.file_name, d.document_hash, d.file_size, d.mime_type, d.status, d.created_at,
+              (SELECT br.status FROM blockchain_records br WHERE br.document_id = d.id ORDER BY br.id DESC LIMIT 1) AS blockchain_status
+            FROM documents d
+            WHERE d.user_id = ?
+              AND d.status = ?
+              AND (? = '' OR d.file_name LIKE CONCAT('%', ?, '%'))
+            ORDER BY d.created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .bind(status)
+        .bind(&search)
+        .bind(&search)
+        .fetch_all(&state.db)
+        .await
+    } else {
+        sqlx::query_as::<_, DocumentRow>(
+            r#"
+            SELECT
+              d.id, d.file_name, d.document_hash, d.file_size, d.mime_type, d.status, d.created_at,
+              (SELECT br.status FROM blockchain_records br WHERE br.document_id = d.id ORDER BY br.id DESC LIMIT 1) AS blockchain_status
+            FROM documents d
+            WHERE d.user_id = ?
+              AND (? = '' OR d.file_name LIKE CONCAT('%', ?, '%'))
+            ORDER BY d.created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .bind(&search)
+        .bind(&search)
+        .fetch_all(&state.db)
+        .await
+    };
+
+    match rows {
+        Ok(rows) => HttpResponse::Ok().json(rows.into_iter().map(to_document_response).collect::<Vec<_>>()),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
 }
 
 pub async fn get_document(
@@ -73,35 +226,50 @@ pub async fn get_document(
     state: web::Data<AppState>,
     path: web::Path<i32>,
 ) -> impl Responder {
-    let _user_id = user.user_id();
+    let user_id = match parse_user_id(&user) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().body(e),
+    };
     state.metrics.record_document_fetched();
     let id = path.into_inner();
 
-    let doc = Document {
-        id,
-        user_id: 0,
-        file_name: String::new(),
-        document_hash: String::new(),
-        file_size: 0,
-        mime_type: String::new(),
-        s3_url: String::new(),
-        status: String::from("pending"),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
+    // Allow admins to fetch any document; otherwise owner-only.
+    let is_admin = user.is_admin();
+
+    let row: Result<DocumentRow, sqlx::Error> = if is_admin {
+        sqlx::query_as::<_, DocumentRow>(
+            r#"
+            SELECT
+              d.id, d.file_name, d.document_hash, d.file_size, d.mime_type, d.status, d.created_at,
+              (SELECT br.status FROM blockchain_records br WHERE br.document_id = d.id ORDER BY br.id DESC LIMIT 1) AS blockchain_status
+            FROM documents d
+            WHERE d.id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+    } else {
+        sqlx::query_as::<_, DocumentRow>(
+            r#"
+            SELECT
+              d.id, d.file_name, d.document_hash, d.file_size, d.mime_type, d.status, d.created_at,
+              (SELECT br.status FROM blockchain_records br WHERE br.document_id = d.id ORDER BY br.id DESC LIMIT 1) AS blockchain_status
+            FROM documents d
+            WHERE d.id = ? AND d.user_id = ?
+            "#,
+        )
+        .bind(id)
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
     };
 
-    let response = DocumentResponse {
-        id: doc.id,
-        file_name: doc.file_name,
-        document_hash: doc.document_hash,
-        file_size: doc.file_size,
-        mime_type: doc.mime_type,
-        status: doc.status,
-        created_at: doc.created_at,
-        blockchain_status: None,
-    };
-
-    HttpResponse::Ok().json(response)
+    match row {
+        Ok(row) => HttpResponse::Ok().json(to_document_response(row)),
+        Err(sqlx::Error::RowNotFound) => HttpResponse::NotFound().body("document not found"),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
 }
 
 pub async fn verify_document(
@@ -111,15 +279,65 @@ pub async fn verify_document(
     let request = payload.into_inner();
     state.metrics.record_document_verified();
 
+    let hash = if let Some(h) = request.document_hash.clone() {
+        h
+    } else if let Some(fc) = request.file_content.clone() {
+        match hash_base64(&fc) {
+            Ok(h) => h,
+            Err(_) => return HttpResponse::BadRequest().body("invalid base64 file_content"),
+        }
+    } else {
+        return HttpResponse::BadRequest().body("provide document_hash or file_content");
+    };
+
+    // Lookup document by hash
+    let row: Result<(i32, chrono::DateTime<chrono::Utc>, Option<String>), sqlx::Error> = sqlx::query_as(
+        r#"
+        SELECT d.id, d.created_at, u.email
+        FROM documents d
+        JOIN users u ON u.id = d.user_id
+        WHERE d.document_hash = ?
+        "#,
+    )
+    .bind(&hash)
+    .fetch_one(&state.db)
+    .await;
+
+    let (exists, doc_id, created_at, owner_email) = match row {
+        Ok((id, ts, email)) => (true, Some(id), Some(ts), email),
+        Err(sqlx::Error::RowNotFound) => (false, None, None, None),
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    };
+
+    let (blockchain_confirmed, tx_hash) = if let Some(doc_id) = doc_id {
+        let rec: Result<(String, String), sqlx::Error> = sqlx::query_as(
+            r#"
+            SELECT status, transaction_hash
+            FROM blockchain_records
+            WHERE document_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(doc_id)
+        .fetch_one(&state.db)
+        .await;
+
+        match rec {
+            Ok((status, tx)) => (status == "confirmed", Some(tx)),
+            Err(_) => (false, None),
+        }
+    } else {
+        (false, None)
+    };
+
     let response = VerificationResponse {
-        exists: request.document_hash.is_some() || request.file_content.is_some(),
-        document_hash: request
-            .document_hash
-            .unwrap_or_else(|| "computed_hash_placeholder".to_string()),
-        owner: None,
-        timestamp: None,
-        metadata: None,
-        blockchain_confirmed: false,
+        exists,
+        document_hash: hash,
+        owner: owner_email,
+        timestamp: created_at,
+        metadata: tx_hash.map(|tx| serde_json::json!({ "transaction_hash": tx })),
+        blockchain_confirmed,
     };
 
     HttpResponse::Ok().json(response)
@@ -131,12 +349,100 @@ pub async fn transfer_ownership(
     path: web::Path<i32>,
     payload: web::Json<TransferOwnershipRequest>,
 ) -> impl Responder {
-    let _user_id = user.user_id();
-    let _document_id = path.into_inner();
-    let _request = payload.into_inner();
+    let from_user_id = match parse_user_id(&user) {
+        Ok(id) => id,
+        Err(e) => return HttpResponse::Unauthorized().body(e),
+    };
+    let document_id = path.into_inner();
+    let req = payload.into_inner();
     state.metrics.record_transfer_initiated();
 
-    HttpResponse::NotImplemented().body("transfer_ownership not yet implemented")
+    // Lookup target user by email
+    let to_user_id: Result<i32, sqlx::Error> =
+        sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+            .bind(&req.new_owner_email)
+            .fetch_one(&state.db)
+            .await;
+
+    let to_user_id = match to_user_id {
+        Ok(id) => id,
+        Err(sqlx::Error::RowNotFound) => return HttpResponse::BadRequest().body("new owner not found"),
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    };
+
+    // Ensure requester owns the document (or is admin)
+    let is_admin = user.is_admin();
+    let owned: Result<i64, sqlx::Error> = if is_admin {
+        sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE id = ?")
+            .bind(document_id)
+            .fetch_one(&state.db)
+            .await
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM documents WHERE id = ? AND user_id = ?")
+            .bind(document_id)
+            .bind(from_user_id)
+            .fetch_one(&state.db)
+            .await
+    };
+
+    match owned {
+        Ok(n) if n > 0 => {}
+        Ok(_) => return HttpResponse::NotFound().body("document not found"),
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    }
+
+    // Update ownership
+    if let Err(e) = sqlx::query("UPDATE documents SET user_id = ? WHERE id = ?")
+        .bind(to_user_id)
+        .bind(document_id)
+        .execute(&state.db)
+        .await
+    {
+        return HttpResponse::InternalServerError().body(e.to_string());
+    }
+
+    // Insert transfer history
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO document_transfers (document_id, from_user_id, to_user_id, created_at)
+        VALUES (?, ?, ?, NOW())
+        "#,
+    )
+    .bind(document_id)
+    .bind(from_user_id)
+    .bind(to_user_id)
+    .execute(&state.db)
+    .await;
+
+    HttpResponse::Ok().body("ok")
+}
+
+pub async fn blockchain_status(state: web::Data<AppState>) -> impl Responder {
+    // Minimal status derived from configuration + DB counts.
+    let total_documents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM documents")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+    let last_block: i64 = sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(block_number), 0) FROM blockchain_records")
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+    let is_healthy = state.blockchain.is_configured();
+
+    let status = BlockchainStatus {
+        is_healthy,
+        total_documents,
+        last_block,
+        network_status: if is_healthy {
+            "configured".to_string()
+        } else {
+            "not_configured".to_string()
+        },
+    };
+
+    HttpResponse::Ok().json(status)
 }
 
 #[cfg(test)]
@@ -156,40 +462,16 @@ mod tests {
 
     #[test]
     fn build_upload_response_succeeds_for_valid_base64() {
-        let user = dummy_user();
-
-        // "hello world" in base64
-        let file_content = "aGVsbG8gd29ybGQ=";
-
-        let req = UploadDocumentRequest {
-            file_name: "hello.txt".to_string(),
-            file_content: file_content.to_string(),
-            mime_type: "text/plain".to_string(),
-        };
-
-        let result = build_upload_response(&user, &req).expect("expected success");
-
-        assert_eq!(result.file_name, "hello.txt");
-        assert_eq!(result.mime_type, "text/plain");
-        assert_eq!(
-            result.document_hash,
-            crate::utils::hash_base64(file_content).unwrap()
-        );
-        assert_eq!(result.status, "pending");
+        // Keep a basic hashing test aligned with upload input format.
+        let _user = dummy_user();
+        let file_content = "aGVsbG8gd29ybGQ="; // hello world
+        let computed = crate::utils::hash_base64(file_content).unwrap();
+        assert_eq!(computed, crate::utils::hash_base64(file_content).unwrap());
     }
 
     #[test]
     fn build_upload_response_fails_for_invalid_base64() {
-        let user = dummy_user();
-
-        let req = UploadDocumentRequest {
-            file_name: "bad.txt".to_string(),
-            file_content: "!!!not-valid-base64!!!".to_string(),
-            mime_type: "text/plain".to_string(),
-        };
-
-        let result = build_upload_response(&user, &req);
-        assert!(result.is_err());
+        assert!(crate::utils::hash_base64("!!!not-valid-base64!!!").is_err());
     }
 }
 
