@@ -19,23 +19,46 @@ This is a complete rewrite of the Node.js/TypeScript implementation in Rust, pro
 
 ```mermaid
 flowchart TB
-    subgraph Client["Client"]
-        User[User / API Client]
+    subgraph User["User"]
+        Browser[Browser]
     end
 
-    subgraph API["Blockchain Document Storage (Actix-web)"]
+    subgraph Frontend["Frontend (React + Vite)"]
+        direction TB
+        subgraph Pages["Pages"]
+            LoginP[Login / Register]
+            DashP[Dashboard]
+            DocsP[Documents]
+            VerifyP[Verify]
+            MetricsP[Metrics]
+        end
+        subgraph Components["Components"]
+            Layout[Layout / Header]
+            DocUpload[DocumentUpload]
+            DocList[DocumentList]
+            DocVerifier[DocumentVerifier]
+        end
+        subgraph State["State & API"]
+            AuthCtx[AuthContext]
+            APIClient[API Client + JWT]
+        end
+        Pages --> Components
+        Components --> AuthCtx
+        AuthCtx --> APIClient
+    end
+
+    subgraph Backend["Backend (Rust / Actix-web)"]
         direction TB
         MW[Middleware: CORS, Logger, JWT Auth]
         subgraph Routes["HTTP Routes"]
-            Auth["/api/auth"]
-            Docs["/api/documents"]
-            BC["/api/blockchain"]
-            Health["/health"]
+            AuthR["/api/auth"]
+            DocsR["/api/documents"]
+            BCR["/api/blockchain"]
+            MetricsR["/api/metrics"]
+            HealthR["/health"]
         end
         subgraph Handlers["Handlers"]
-            AuthH[auth: register, login, me, logout]
-            DocsH[documents: upload, list, get, verify, transfer]
-            HealthH[health check]
+            AuthH[auth, documents, health, metrics]
         end
         subgraph Services["Services"]
             AuthS[AuthService]
@@ -53,71 +76,57 @@ flowchart TB
         ETH[Ethereum Network]
     end
 
-    User -->|HTTP| MW
+    Browser -->|HTTPS| Frontend
+    Frontend -->|REST / JSON| MW
     MW --> Routes
-    Auth --> AuthH
-    Docs --> DocsH
-    Health --> HealthH
-    BC --> DocsH
+    Routes --> Handlers
+    Handlers --> Services
+    Handlers --> Hash
     AuthH --> AuthS
-    DocsH --> StorageS
-    DocsH --> BCS
-    DocsH --> Hash
-    AuthH --> Hash
     StorageS --> S3
     AuthS --> MySQL
     BCS --> ETH
-    DocsH --> MySQL
+    Handlers --> MySQL
 ```
+
+### Full-Stack Overview
+
+| Layer | Technology | Responsibility |
+|-------|------------|----------------|
+| **UI** | React 18, TypeScript, Vite, Tailwind | Pages, components, auth flow, API calls |
+| **API** | Actix-web, Rust | REST endpoints, JWT validation, request handling |
+| **Business** | Services (auth, storage, blockchain) | Document logic, S3, blockchain interaction |
+| **Data** | MySQL/TiDB, AWS S3 | Persistence, file storage |
+| **Chain** | Ethereum (ethers-rs) | Document verification, provenance |
 
 ### Technology Stack
 
-**Web Framework:**
-- `actix-web` 4.9 - High-performance async HTTP server
-- `actix-cors` - CORS middleware
-- `actix-multipart` - Multipart form data handling
+**Frontend:**
+- React 18 + TypeScript
+- Vite - Build tool & dev server
+- Tailwind CSS - Styling
+- React Router v6 - Routing
 
-**Async Runtime:**
-- `tokio` 1.42 - Asynchronous runtime with full features
-- `futures` - Async combinators and utilities
-
-**Database:**
-- `sqlx` 0.8 - Compile-time checked SQL queries
-- MySQL/TiDB support with connection pooling
-
-**Cryptography:**
-- `sha2` - SHA-256 hashing
-- `bcrypt` - Password hashing
-- `jsonwebtoken` - JWT authentication
-- `hex` - Hexadecimal encoding
-
-**Blockchain:**
-- `ethers` 2.0 - Ethereum library for Rust
-- Smart contract interaction
-- Transaction signing and verification
-
-**Storage:**
-- `aws-sdk-s3` - AWS S3 integration
-- Async file uploads and downloads
-
-**Serialization:**
-- `serde` - Serialization framework
-- `serde_json` - JSON support
-
-**Error Handling:**
-- `anyhow` - Flexible error handling
-- `thiserror` - Custom error types
+**Backend (Rust):**
+- **Web Framework:** actix-web 4.9, actix-cors, actix-multipart
+- **Async Runtime:** tokio 1.42, futures
+- **Database:** sqlx 0.8, MySQL/TiDB with connection pooling
+- **Cryptography:** sha2, bcrypt, jsonwebtoken, hex
+- **Blockchain:** ethers 2.0 (smart contracts, transaction verification)
+- **Storage:** aws-sdk-s3
+- **Serialization:** serde, serde_json
+- **Error Handling:** anyhow, thiserror
 
 ## Project Structure
 
 ```
 blockchain-doc-storage-rust/
-├── Cargo.toml                 # Dependencies and project metadata
+├── Cargo.toml                 # Rust dependencies and project metadata
 ├── .env.example               # Environment variables template
 ├── README.md                  # This file
 ├── RUST_GUIDE.md             # Detailed Rust implementation guide
 ├── FRONTEND_DESIGN.md        # Frontend architecture & API integration
-├── src/
+├── src/                       # Backend (Rust)
 │   ├── main.rs               # Application entry point
 │   ├── models/               # Data models
 │   │   ├── mod.rs
@@ -141,6 +150,15 @@ blockchain-doc-storage-rust/
 │       ├── mod.rs
 │       ├── hash.rs           # Hashing utilities
 │       └── errors.rs         # Custom error types
+├── frontend/                  # Frontend (React + Vite)
+│   ├── src/
+│   │   ├── api/              # API client, auth, documents, metrics
+│   │   ├── auth/             # AuthContext, ProtectedRoute
+│   │   ├── components/       # Layout, DocumentUpload, DocumentList, etc.
+│   │   ├── pages/            # Login, Register, Dashboard, Documents, Verify, Metrics
+│   │   └── types/            # TypeScript types
+│   ├── package.json
+│   └── vite.config.ts
 └── migrations/               # Database migrations
     └── 001_initial_schema.sql
 ```
