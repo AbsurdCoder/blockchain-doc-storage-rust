@@ -1,4 +1,4 @@
-# Blockchain Document Verification Platform - Rust Implementation
+# Blockchain Document Platform - Rust Implementation
 
 A high-performance, memory-safe blockchain-based document verification system written in Rust.
 
